@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>NFC UID Logger</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans Thai", sans-serif; }
+    body { max-width: 720px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin: 12px 0; background: #ffffff; }
+    button { padding: 12px 16px; border-radius: 10px; border: 1px solid #9ca3af; background: #f9fafb; }
+    button:disabled { opacity: 0.5; }
+    .uid { font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .log { height: 240px; overflow: auto; background: #f8fafc; border: 1px solid #e2e8f0; padding: 8px; border-radius: 8px; }
+    .ok { color: #0a7; }
+    .err { color: #c00; }
+    .warn { color: #a66; }
+  </style>
+</head>
+<body>
+  <h1>สแกน NFC เพื่อบันทึก UID</h1>
+
+  <div class="card">
+    <div><b>สถานะ:</b> <span id="status">พร้อม</span></div>
+    <div style="margin-top:10px; display:flex; gap:8px;">
+      <button id="btnStart">เริ่มสแกน</button>
+      <button id="btnStop" disabled>หยุด</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div><b>UID ล่าสุด:</b> <span id="last" class="uid">-</span></div>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom:6px;"><b>บันทึกเหตุการณ์</b></div>
+    <div id="log" class="log"></div>
+  </div>
+
+<script>
+  // ====== ตั้งค่าให้ตรงระบบคุณ ======
+  const GAS_URL   = 'https://script.google.com/macros/s/AKfycb_REPLACE_ME/exec'; // ← วาง Web App URL ของ Apps Script
+  const BEARER    = 'PUT_A_RANDOM_SECRET_TOKEN_HERE'; // ต้องตรงกับ BEARER_TOKEN ใน Apps Script (หรือ '' ถ้าไม่ใช้)
+  // ===================================
+
+  // ต้องเป็น top-level page เท่านั้น
+  if (window.top !== window.self) {
+    document.body.innerHTML = '<h2>หน้านี้ถูกรันใน iframe</h2><p>Web NFC จะไม่ทำงาน กรุณาเปิดลิงก์นี้โดยตรง (ไม่ใช่ฝังในแอป/เว็บอื่น)</p>';
+  }
+
+  const $ = s => document.querySelector(s);
+  const log = (msg, cls='') => {
+    const el = document.createElement('div');
+    if (cls) el.className = cls;
+    el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    $('#log').prepend(el);
+  };
+
+  function supportsWebNFC() {
+    return 'NDEFReader' in window;
+  }
+
+  let controller = null;
+  let lastUID = '';
+  let lastTime = 0;
+
+  async function startScan() {
+    if (!supportsWebNFC()) {
+      $('#status').textContent = 'ไม่รองรับ Web NFC (ต้องใช้ Android + Chrome + HTTPS)';
+      log('Web NFC not supported', 'err');
+      alert('อุปกรณ์/เบราว์เซอร์นี้ไม่รองรับ Web NFC (ใช้ Android + Chrome และเปิดผ่าน HTTPS)');
+      return;
+    }
+
+    try {
+      controller = new AbortController();
+      const reader = new NDEFReader();
+      await reader.scan({ signal: controller.signal });
+      $('#status').textContent = 'กำลังสแกน...';
+      $('#btnStart').disabled = true;
+      $('#btnStop').disabled  = false;
+      log('เริ่มสแกนแล้ว');
+
+      reader.onreadingerror = () => {
+        log('อ่านแท็กผิดพลาด', 'err');
+      };
+
+      reader.onreading = async (ev) => {
+        // ดึง UID (serialNumber) แล้ว normalize
+        const uid = (ev.serialNumber || '').replace(/:/g, '').toLowerCase();
+        if (!uid) { log('ไม่พบ UID', 'err'); return; }
+
+        // กันสแกนซ้ำในช่วงสั้น ๆ (1.2 วินาที)
+        const now = Date.now();
+        if (uid === lastUID && (now - lastTime) < 1200) {
+          log(`ข้าม (ซ้ำเร็วเกิน): ${uid}`, 'warn');
+          return;
+        }
+        lastUID = uid; lastTime = now;
+
+        $('#last').textContent = uid.toUpperCase();
+        log(`อ่าน UID: ${uid}`);
+
+        await sendToGAS(uid);
+        feedback();
+      };
+
+    } catch (err) {
+      $('#status').textContent = 'เริ่มสแกนไม่สำเร็จ';
+      log('เริ่มสแกนไม่สำเร็จ: ' + err, 'err');
+      alert('เริ่มสแกนไม่ได้: ' + err);
+    }
+  }
+
+  function stopScan() {
+    if (controller) {
+      controller.abort();
+      controller = null;
+    }
+    $('#btnStart').disabled = false;
+    $('#btnStop').disabled  = true;
+    $('#status').textContent = 'หยุดสแกนแล้ว';
+    log('หยุดสแกนแล้ว');
+  }
+
+  async function sendToGAS(uid) {
+    try {
+      const payload = {
+        uid,
+        device: (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || ''
+      };
+      const res = await fetch(GAS_URL + '?origin=' + encodeURIComponent(location.origin), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(BEARER ? { 'Authorization': 'Bearer ' + BEARER } : {})
+        },
+        body: JSON.stringify(payload)
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json.ok) {
+        log(`บันทึกแล้ว: ${uid}`, 'ok');
+      } else {
+        log(`บันทึกล้มเหลว: ${json.error || res.status}`, 'err');
+      }
+    } catch (e) {
+      log('ส่งข้อมูลไม่สำเร็จ: ' + e, 'err');
+    }
+  }
+
+  function feedback() {
+    if (navigator.vibrate) navigator.vibrate(50);
+    try {
+      // เสียงสั้น ๆ (silent fallback)
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator(); const g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination); o.type = 'sine'; o.frequency.value = 880;
+      g.gain.setValueAtTime(0.001, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.3, ctx.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
+      o.start(); o.stop(ctx.currentTime + 0.13);
+    } catch {}
+  }
+
+  $('#btnStart').addEventListener('click', startScan);
+  $('#btnStop').addEventListener('click',  stopScan);
+</script>
+</body>
+</html>
